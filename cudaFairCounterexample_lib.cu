@@ -12,138 +12,15 @@
 #include "device_launch_parameters.h"
 using namespace std;
 
-__constant__ int SCCSIZE = 0;
-__constant__ int TOTALSIZE = 0;
-__constant__ int TASKTYPE = 0;
+__constant__ int SCCSIZE;
+__constant__ int TOTALSIZE;
+__constant__ int TASKTYPE;
 __constant__ int WARP_T = 32;
 __constant__ int BLOCK_T = 512;
-__constant__ int INITIAL_T = 32;
+__constant__ int INITIAL_T;
 __constant__ int EXPAND_LEVEL = 4;
 __constant__ int BLOCK_SYN_THRESHOLD = 8;
 
-
-/***********Template Queue*****************/
-template <class Type>  
-class QueueItem
-{  
-public:  
-	QueueItem(const Type &t) : item(t), next(0) {}  
-	Type item;  
-	QueueItem *next;  
-};  
-
-template <class Type>  
-class Queue
-{  
-public:  
-	Queue() : head(0),tail(0) {this->size = 0}  
-	Queue(const Queue &Q):head(0), tail(0)
-	{  
-		copy_elems(Q);  
-		this->size = Q.count();
-	}  
-	template <class Type2> 
-	Queue<Type>& operator=(const Queue<Type2>&);  
-	~Queue()
-	{ 
-		destroy();
-	}  
-	Type& front() 
-	{ 
-		return head->item;
-	}  
-	const Type &front() const { return head->item; }  
-	void push( const Type& );  
-	void pop();  
-	int count();
-	bool empty() const
-	{  
-		return head == 0;  
-	}  
-private:
-	int size;
-	QueueItem<Type> *head;  
-	QueueItem<Type> *tail;  
-	void destroy();  
-	void copy_elems(const Queue&);  
-}; 
-
-template <class Type>
-int Queue<Type>::count()
-{
-	return this->size;
-}
-
-template <class Type>  
-void Queue<Type>::push( const Type& val)  
-{  
-	QueueItem<Type> *pt = new QueueItem<Type>(val);  
-	if(empty())  
-		head = tail = pt;  
-	else {  
-		tail->next = pt;  
-		tail = pt;  
-	} 
-	this->size++;
-}  
-
-template <class Type>  
-void Queue<Type>::pop()  
-{  
-	QueueItem<Type>* p = head;  
-	head = head->next;
-	this->size--;
-	delete p;  
-}  
-
-template <class Type>  
-void Queue<Type>::destroy()  
-{  
-	while(!empty())  
-		pop();  
-}  
-
-template <class Type>  
-void Queue<Type>::copy_elems(const Queue& orig)  
-{  
-	for(QueueItem<Type>* pt = orig.head;pt;pt = pt->next)  
-		push(pt->item);  
-} 
-
-template <class Type>  
-template <class Type2> 
-Queue<Type>& Queue<Type>::operator=( const Queue<Type2>& orig)  
-{  
-	if((void*)this == (void*)&orig) {  
-		*this;  
-	}  
-	Queue<Type2> tmp(orig);  
-	destroy(); // delete  
-
-	while(!tmp.empty())  
-	{  
-		push(tmp.front());  
-		tmp.pop();  
-	}  
-	this->size = orig.count();
-	return *this;  
-}  
-/********************************************************************/
-
-//class pathnode
-class Pathnode{
-public:
-	int Nid;
-	queue<int> tmppath;
-	int queueindex;
-
-	Pathnode(){}
-	Pathnode(int nid)
-	{
-		Nid = nid;
-		queueindex = 0;
-	}
-};
 
 //class Gqueue for global memeory access
 class GQueue{
@@ -156,11 +33,9 @@ public:
 	//int backupblockcount;
 
 	GQueue()
-	{
-		blockcount = 0;
-		//backupblockcount = 0;
+	{	//backupblockcount = 0;
 	}
-	~GQueue(){;}
+	~GQueue(){}
 };
 
 
@@ -205,7 +80,7 @@ __device__ void __gpu_blocks_simple_syn(int goalval)
 			;
 		}
 	}
-	cudaThreadSynchronize();
+	__syncthreads();
 }
 __device__ void __gpu_blocks_tree_syn(int goalval, int * arrayin, int * arrayout)
 {
@@ -227,7 +102,7 @@ __device__ void __gpu_blocks_tree_syn(int goalval, int * arrayin, int * arrayout
 			while (Arrayin[tid_in_block] != goalval) 
 			{;}
 		}
-		cudaThreadSynchronize();
+		__syncthreads();
 	
 		if (tid_in_block < nBlockNum)
 		{
@@ -240,13 +115,13 @@ __device__ void __gpu_blocks_tree_syn(int goalval, int * arrayin, int * arrayout
 		while (Arrayout[bid] != goalval)
 		{ ;}
 	}
-	cudaThreadSynchronize();
+	__syncthreads();
 }
 
 /*******************************************/
 
 //Quick search for if scc reach
-__global__ void BSearchIfreach(bool * theresult, int * searchlist, int size, int key)
+__device__ void BSearchIfreach(bool * theresult, int * searchlist, int size, int key)
 {
 	int Bslow = 0;
 	int Bshigh = size-1;
@@ -270,52 +145,90 @@ __global__ void BSearchIfreach(bool * theresult, int * searchlist, int size, int
 	}
 }
 
-__global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, Pathnode * pathrecording, int * G_pathrecMutex)  //for optimization, if outgoing is not very big, it can be stored in the specific memory in kepler
+__global__ void ChildPath(int **, int *, int *, int *, int **, int *, int * ); 
+__global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, int * pathrecording, int * G_pathrecMutex)  //for optimization, if outgoing is not very big, it can be stored in the specific memory in kepler
 {
 	int threadindex = blockIdx.x * blockDim.x + threadIdx.x;
 	int inblocktid = threadindex;
 	int Squeueindex,Squeueposindex;
 
-	extern __shared__ Queue<int> Init_S_queue[4][32];
-	extern __shared__ Pathnode S_pathrecord[];
+	__shared__ int Init_S_Queue_head[4][32];
+	__shared__ int Init_S_Queue_tail[4][32];
+
+	int i,j;
+	for(i=0;i<32;i++)
+	{
+		for(j=0;j<4;j++)
+		{
+			Init_S_Queue_head[j][i] = j*(TOTALSIZE-SCCSIZE);
+			Init_S_Queue_tail[j][i] = j*(TOTALSIZE-SCCSIZE);
+		}
+	}
+
+	extern __shared__ int S[];
+	//__shared__ int * S_Pathrecord = S;
+	__shared__ int * S_Inherit_relation = S;  
 	if(threadindex == 0)
 	{
-		for(int i = 0; i< TOTALSIZE-SCCSIZE; i++)
+		for(i = 0; i< (TOTALSIZE-SCCSIZE); i++)
 		{	
-			S_pathrecord[i].Nid = i;
-			S_pathrecord[i].queueindex = 0;
+			//S_pathrecord[i].Nid = i;
+			S_Inherit_relation[i] = -1;
 		}
  	}
-	extern __shared__ int pathrecordmutex[];
+
+	__shared__ int *pathrecordmutex = &S_Inherit_relation[TOTALSIZE-SCCSIZE];
+	
 	if(threadindex == 0)
 	{
-		for(int i = 0; i< TOTALSIZE-SCCSIZE; i++)
+		for(i = 0; i< TOTALSIZE-SCCSIZE; i++)
 		{	
 			pathrecordmutex[i] = 0;
 		}
 	}
-	cudaThreadSynchronize();
+	__shared__ int * Init_S_Queue[32];
+    //__shared__ int Init_S_queue[32][4*(TOTALSIZE-SCCSIZE)];
+	if(threadindex == 0)
+	{
+		Init_S_Queue[0]= &pathrecordmutex[TOTALSIZE-SCCSIZE];
+		for(i = 0; i < 4*(TOTALSIZE-SCCSIZE); i++) 
+		{
+			Init_S_Queue[0][i] = -1;
+		}
+		for(i = 1; i<32; i++)
+		{
+			Init_S_Queue[i]= &Init_S_Queue[i-1][i*(TOTALSIZE-SCCSIZE)*4];
+			for(j = 0; j < 4*(TOTALSIZE-SCCSIZE); j++) 
+			{
+				Init_S_Queue[i][j] = -1;
+			}
+		}
+	}
+	
+	__syncthreads();
 
-	extern __shared__ int queuesize;
-	extern __shared__ bool ifexpand;
-	extern __shared__ bool ifSccReach;
-	extern __shared__ unsigned int path2sccmutex;
-	extern __shared__ bool iffinish;
+	__shared__ int queuesize;
+	__shared__ bool ifexpand;
+	__shared__ bool ifSccReach;
+	__shared__ unsigned int path2sccmutex;
+	__shared__ bool iffinish;
 
 	int tmpnode;
 	//bool ifnew;
 
 	Squeueindex = (inblocktid/32+1)%3;
 	Squeueposindex = inblocktid % 31;
+	int writeindex, readindex;
 
 	if(inblocktid == 0)
 	{
 		BSearchIfreach(&ifSccReach,scc,SCCSIZE, startid);
-		S_pathrecord[startid].tmppath.push(startid);
-		S_pathrecord[startid].queueindex++;
 		if(!ifSccReach)
 		{
-			Init_S_queue[Squeueindex][Squeueposindex].push(startid);
+			writeindex = Init_S_Queue_tail[Squeueindex][Squeueposindex];
+			Init_S_Queue[Squeueposindex][writeindex]=startid;
+			Init_S_Queue_tail[Squeueindex][Squeueposindex]++; //move head tail, need modification in the S_queue part.
+
 			queuesize = 1;
 			ifexpand = false;
 			ifSccReach = false;
@@ -324,18 +237,20 @@ __global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, P
 
 	}
 
-	cudaThreadSynchronize();
+	__syncthreads();
 
 	if(!ifSccReach)
 	{
 		do{
 			if(threadindex < queuesize)
 			{
-				int peeknode = Init_S_queue[Squeueindex][Squeueposindex].front();
+				readindex = Init_S_Queue_head[Squeueindex][Squeueposindex];
+				int peeknode = Init_S_Queue[Squeueposindex][readindex];
 			
-				if(peeknode)
+				if(peeknode != -1)
 				{
 					int succ_num = 0;
+					int relationindex;
 				
 					//judge if belong to scc(sorted)
 					BSearchIfreach(&ifSccReach,scc,SCCSIZE, peeknode);
@@ -346,11 +261,14 @@ __global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, P
 						{  
 							if(atomicExch(&path2sccmutex, 1))   //use lock to modify the path2scc
 							{
-								for(int i=0; i< S_pathrecord[peeknode].queueindex; i++)
+								path2scc[0] = peeknode;
+								relationindex = peeknode;
+								for(i=1; S_Inherit_relation[relationindex] != startid; i++)
 								{
-									path2scc[i] = (S_pathrecord[peeknode].tmppath.front());
-									S_pathrecord[peeknode].tmppath.pop();
+									path2scc[i] = S_Inherit_relation[relationindex];
+									relationindex = path2scc[i];
 								}
+
 								iffinish = true;
 								atomicExch(&path2sccmutex, 0);
 							}
@@ -360,20 +278,22 @@ __global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, P
 
 					while(outgoing[peeknode][succ_num] != -1)
 					{					
-						int pathcount = 0;
-						bool ifnewjudge = true;
 
 						tmpnode = outgoing[peeknode][succ_num];
 						if(atomicExch(&pathrecordmutex[tmpnode], 1))
 						{
-							if(S_pathrecord[tmpnode].tmppath.size() > 0)
+							if(S_Inherit_relation[tmpnode] != -1)
 							{
 								atomicExch(&path2sccmutex, 0);
 								succ_num++;
 								continue;
 							}
-							S_pathrecord[tmpnode].tmppath = S_pathrecord[peeknode].tmppath;
-							Init_S_queue[Squeueindex][Squeueposindex].push(tmpnode);
+							S_Inherit_relation[tmpnode] = peeknode;
+							writeindex = Init_S_Queue_tail[Squeueindex][Squeueposindex];
+							atomicExch(&path2sccmutex, 0);
+
+							Init_S_Queue[Squeueposindex][writeindex] = tmpnode;
+							Init_S_Queue_tail[Squeueindex][Squeueposindex]++;
 						}
 						else
 						{
@@ -384,23 +304,25 @@ __global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, P
 												
 						succ_num++;
 					}
-					Init_S_queue[Squeueindex][Squeueposindex].pop();
-
+					Init_S_Queue_head[Squeueindex][Squeueposindex]++;
 				}			
 			}
 			if(threadindex == 0)
 				iffinish = false;
 	
-			cudaThreadSynchronize();
+			__syncthreads();
 
 			if(inblocktid == 0)
 			{
-				for(int i = 0; i < 32; i++)
-					queuesize += Init_S_queue[Squeueindex][i].count();
+				for(i = 0; i < 32; i++)
+				{
+					for(j = 0; j < 4; j++)
+						queuesize += (Init_S_Queue_tail[j][i] - Init_S_Queue_head[j][i]);
+				}
 				if(queuesize > INITIAL_T)
 					ifexpand = true;
 			}
-			cudaThreadSynchronize();
+			__syncthreads();
 		}while(ifexpand);
 
 		int expandedtasksize = 0;
@@ -421,39 +343,46 @@ __global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, P
 			for(int j=0; j<childbsize; j++)
 			{
 				if(TASKTYPE == 1)
-					G_Queue.G_queue[j] = new __device__ int[TOTALSIZE-SCCSIZE - WARP_T]; //queue stored in Global Queue
+					G_Queue.G_queue[j] = new int[TOTALSIZE-SCCSIZE]; //queue stored in Global Queue
 				else
-					G_Queue.G_queue[j] = new __device__ int[SCCSIZE - WARP_T];
+					G_Queue.G_queue[j] = new int[SCCSIZE];
 				G_Queue.G_queue_size[j] = 0;
 			}
 		
 			int tmpcount = 0;
 			int tmp;
+			int tmpstart, tmpend;
 			for(int i = 0; i < 4; i++)
 			{
 				for(int j = 0; j < 32; j++)
 				{
-					for(int m = 0; m < Init_S_queue[i][j].count(); m++)
+					readindex = Init_S_Queue_head[i][j];
+					writeindex = Init_S_Queue_tail[i][j];
+					for(int m = 0; m < writeindex-readindex; m++)
 					{
-						tmp = Init_S_queue[i][j].front();
-						if(pathrecording[tmp].tmppath.size() == 0)
+						tmpstart = Init_S_Queue_head[i][j];
+						tmpend = Init_S_Queue_tail[i][j];
+						tmp = Init_S_Queue[j][tmpstart];
+						if(pathrecording[tmp] != -1)
 						{
 							if(atomicExch(&G_pathrecMutex[tmp], 1))
 							{
-								pathrecording[tmp].tmppath = S_pathrecord[tmp].tmppath;
+								pathrecording[tmp] = S_Inherit_relation[tmp];
+								
 								atomicExch(&path2sccmutex, 0);
+								S_Inherit_relation[tmp] = -1;
 							}
 							else
 							{
-								Init_S_queue[i][j].pop();
+								Init_S_Queue_head[i][j]++;
 								tmpcount++;
 								tmpcount=tmpcount%(childbsize-1);
 								continue;
 							}
-							G_Queue.G_queue[tmpcount][G_Queue.G_queue_size[tmpcount]] = Init_S_queue[i][j].front();    //not sure about if the memory copy will work,need confirm.
+							G_Queue.G_queue[tmpcount][G_Queue.G_queue_size[tmpcount]] = Init_S_Queue[j][tmpstart];    //not sure about if the memory copy will work,need confirm.
 							G_Queue.G_queue_size[tmpcount]++;
 						}
-						Init_S_queue[i][j].pop();
+						Init_S_Queue_head[i][j]++;
 						tmpcount++;
 						tmpcount=tmpcount%(childbsize-1);
 						
@@ -462,7 +391,7 @@ __global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, P
 			}
 		}
 
-		cudaThreadSynchronize();
+		__syncthreads();
 	
 		int expandtime = 1;
 		queuesize = 0;
@@ -483,7 +412,7 @@ __global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, P
 						P_taskd_index[i] = queuesize;
 					}
 				}
-				P_G_sequence_index = new __device__ int * [queuesize];
+				P_G_sequence_index = new  int * [queuesize];
 				expandedtasksize = queuesize;
 			}
 
@@ -527,16 +456,16 @@ __global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, P
 
 				if(childbsize > 1)
 				{
-					Arrayin = new __device__ int[childbsize];
-					Arrayout = new __device__ int[childbsize];
-					ChildPath<<<(EXPAND_LEVEL*(averagetask)), childbsize>>>(P_G_sequence_index, P_taskd_index, path2scc,scc,outgoing, pathrecording, G_pathrecMutex);
+					Arrayin = new int[childbsize];
+					Arrayout = new int[childbsize];
+					ChildPath<<<(EXPAND_LEVEL*(averagetask)), childbsize>>>(startid,P_G_sequence_index, P_taskd_index, path2scc,scc,outgoing, pathrecording, G_pathrecMutex);
 					cudaDeviceSynchronize();
 				}
 				else
 				{
-					Arrayin = new __device__ int[1];
-					Arrayout = new __device__ int[1];
-					ChildPath<<<512,1>>>(P_G_sequence_index, P_taskd_index, path2scc,scc,outgoing, pathrecording, G_pathrecMutex);
+					Arrayin = new int[1];
+					Arrayout = new int[1];
+					ChildPath<<<512,1>>>(startid,P_G_sequence_index, P_taskd_index, path2scc,scc,outgoing, pathrecording, G_pathrecMutex);
 					cudaDeviceSynchronize();
 				}
 				//call child path,how to combine each block to just one SM?
@@ -547,41 +476,74 @@ __global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, P
 			}
 
 			if(ifneedsyn)
-				cudaThreadSynchronize();
+				__syncthreads();
 		}	
 	}
 }
 
-__global__ void ChildPath(int ** G_sequence_Queue, int * taskindex, int * p2scc, int * scc, int ** outgoing, Pathnode * pathrecording, int * G_pathrecMutex)   //dynamic parallel in cuda, all static data could be stored in specific storage of Kepler
+__global__ void ChildPath(int startid, int ** G_sequence_Queue, int * taskindex, int * p2scc, int * scc, int ** outgoing, int * pathrecording, int * G_pathrecMutex)   //dynamic parallel in cuda, all static data could be stored in specific storage of Kepler
 {
 	int inblocktindex = threadIdx.x;
 	int globalthreadindex = blockDim.x * blockIdx.x + threadIdx.x;
 	int Squeueindex, Squeueposindex;
-
-	extern __shared__ Queue<int> Child_Init_S_queue[4][32];
-	extern __shared__ Pathnode S_pathrecord[];
-	if(inblocktindex == 0)
+	int i,j;
+	////////////////////////////
+	__shared__ int C_Init_S_Queue_head[4][32];
+	__shared__ int C_Init_S_Queue_tail[4][32];
+	for(i=0;i<32;i++)
 	{
-		for(int i = 0; i< TOTALSIZE-SCCSIZE; i++)
-		{	
-			S_pathrecord[i].Nid = i;
-			S_pathrecord[i].queueindex = 0;
+		for(j=0;j<4;j++)
+		{
+			C_Init_S_Queue_head[j][i] = j*(TOTALSIZE-SCCSIZE);
+			C_Init_S_Queue_tail[j][i] = j*(TOTALSIZE-SCCSIZE);
 		}
 	}
-	extern __shared__ int pathrecordmutex[];
+	extern __shared__ int C[];
+	//__shared__ int * S_Pathrecord = S;
+	__shared__ int * C_S_Inherit_relation = C;  
 	if(inblocktindex == 0)
 	{
-		for(int i = 0; i< TOTALSIZE-SCCSIZE; i++)
+		for(i = 0; i< (TOTALSIZE-SCCSIZE); i++)
+		{	
+			//S_pathrecord[i].Nid = i;
+			C_S_Inherit_relation[i] = -1;
+		}
+	}
+
+	__shared__ int *pathrecordmutex = &C_S_Inherit_relation[TOTALSIZE-SCCSIZE];
+
+	if(inblocktindex == 0)
+	{
+		for(i = 0; i< TOTALSIZE-SCCSIZE; i++)
 		{	
 			pathrecordmutex[i] = 0;
 		}
 	}
-
-	cudaThreadSynchronize();
-	extern __shared__ int queuesize;
-	extern __shared__ bool ifSccReach;
-	extern __shared__ bool iffinish;
-	extern __shared__ unsigned int C_path2sccmutex;
+	__shared__ int * C_Init_S_Queue[32];
+	//__shared__ int Init_S_queue[32][4*(TOTALSIZE-SCCSIZE)];
+	if(inblocktindex == 0)
+	{
+		C_Init_S_Queue[0]= &pathrecordmutex[TOTALSIZE-SCCSIZE];
+		for(i = 0; i < 4*(TOTALSIZE-SCCSIZE); i++) 
+		{
+			C_Init_S_Queue[0][i] = -1;
+		}
+		for(i = 1; i<32; i++)
+		{
+			C_Init_S_Queue[i]= &C_Init_S_Queue[i-1][i*(TOTALSIZE-SCCSIZE)*4];
+			for(j = 0; j < 4*(TOTALSIZE-SCCSIZE); j++) 
+			{
+				C_Init_S_Queue[i][j] = -1;
+			}
+		}
+	}
+	///////////////////////////////////
+	__syncthreads();
+       
+	__shared__ int queuesize;
+	__shared__ bool ifSccReach;
+	__shared__ bool iffinish;
+	__shared__ unsigned int C_path2sccmutex;
 
 
 	int duration=taskindex[blockIdx.x + 1] - taskindex[blockIdx.x];
@@ -598,7 +560,7 @@ __global__ void ChildPath(int ** G_sequence_Queue, int * taskindex, int * p2scc,
 	{
 		Child_syn_need = false;
 		Child_need_back2parent = false;
-		Child_Queue_index = new __device__ int[gridDim.x];
+		Child_Queue_index = new int[gridDim.x];
 		Child_Expandedtask = 0;
 	}
 
@@ -609,6 +571,7 @@ __global__ void ChildPath(int ** G_sequence_Queue, int * taskindex, int * p2scc,
 	
 	Squeueindex = inblocktindex/32;
 	Squeueposindex = inblocktindex % 31;
+	int cwriteindex, creadindex;
 	while(!G_ifsccReach && !Child_need_back2parent)
 	{
 		//copy data from global memory to shared memory
@@ -618,43 +581,50 @@ __global__ void ChildPath(int ** G_sequence_Queue, int * taskindex, int * p2scc,
 		{
 			for(int i=0; i<duration/blockDim.x; i++)
 			{
-				Child_Init_S_queue[Squeueindex][Squeueposindex].push(*(G_sequence_Queue)[taskindex[blockIdx.x]+ i * blockDim.x + inblocktindex]);
+				cwriteindex = C_Init_S_Queue_tail[Squeueindex][Squeueposindex];
+				C_Init_S_Queue[Squeueposindex][cwriteindex]=(*(G_sequence_Queue)[taskindex[blockIdx.x]+ i * blockDim.x + inblocktindex]);
+				C_Init_S_Queue_tail[Squeueindex][Squeueposindex]++;
 			}
 		}
 		if(inblocktindex < duration - (duration/blockDim.x)*blockDim.x)
 		{
-			Child_Init_S_queue[Squeueindex][Squeueposindex].push(*(G_sequence_Queue)[taskindex[blockIdx.x] + (duration/blockDim.x)*blockDim.x + inblocktindex]);
+			cwriteindex = C_Init_S_Queue_tail[Squeueindex][Squeueposindex];
+			C_Init_S_Queue[Squeueposindex][cwriteindex] = (*(G_sequence_Queue)[taskindex[blockIdx.x] + (duration/blockDim.x)*blockDim.x + inblocktindex]);
+			C_Init_S_Queue_tail[Squeueindex][Squeueposindex]++;
 		}
-		cudaThreadSynchronize();
+		__syncthreads();
 
 		if(globalthreadindex == 0)   //!not confirmed if needed this
 			free(*G_sequence_Queue);
 		//////////////////////////////////////////////////
 		if(inblocktindex < queuesize)
 		{
-			Childpeeknode = Child_Init_S_queue[Squeueindex][Squeueposindex].front();
+			creadindex = C_Init_S_Queue_head[Squeueindex][Squeueposindex];
+			Childpeeknode = C_Init_S_Queue[Squeueposindex][creadindex];
 			if(Childpeeknode)
 			{
 				int succ_num = 0;
+				int relationindex;
 				BSearchIfreach(&ifSccReach, scc, SCCSIZE, Childpeeknode);
 
 				if(ifSccReach == true)
 				{
 					while(!iffinish)  
 					{  
-						int t = S_pathrecord[Childpeeknode].queueindex;
 						if(atomicExch(&C_path2sccmutex, 1))   //use lock to modify the path2scc
 						{
-							for(int i=0; i < t; i++)
+							p2scc[0] = Childpeeknode;
+							relationindex = Childpeeknode;
+							for(i=1; C_S_Inherit_relation[relationindex] != -1; i++)
 							{
-								p2scc[i] = S_pathrecord[Childpeeknode].tmppath.front();
-								S_pathrecord[Childpeeknode].tmppath.pop();
+								p2scc[i] = C_S_Inherit_relation[relationindex];
+								relationindex = p2scc[i];
 							}
 
-							for(int j=0; j < (pathrecording[p2scc[t - 1]]).queueindex; j++ )
+							for(j=0; pathrecording[relationindex] != startid; j++)
 							{
-								p2scc[t+j] = (pathrecording[p2scc[t - 1]]).tmppath.front();
-								(pathrecording[p2scc[t - 1]]).tmppath.pop();
+								p2scc[i+j] = pathrecording[relationindex];
+								relationindex = p2scc[i+j];
 							}
 							iffinish = true;
 							atomicExch(&C_path2sccmutex, 0);
@@ -672,20 +642,22 @@ __global__ void ChildPath(int ** G_sequence_Queue, int * taskindex, int * p2scc,
 
 				while(outgoing[Childpeeknode][succ_num] != -1)
 				{
-					int pathcount = 0;
-					bool ifnewjudge = true;
+					//int pathcount = 0;
+					//bool ifnewjudge = true;
 
 					tmpnode = outgoing[Childpeeknode][succ_num];
 					if(atomicExch(&pathrecordmutex[tmpnode], 1))
 					{
-						if(S_pathrecord[tmpnode].tmppath.size() > 0)
+						if(C_S_Inherit_relation[tmpnode] != -1)
 						{
 							atomicExch(&pathrecordmutex[tmpnode], 0);
 							succ_num++;
 							continue;
 						}
-						S_pathrecord[tmpnode].tmppath = S_pathrecord[Childpeeknode].tmppath;
-						Child_Init_S_queue[Squeueindex][Squeueposindex].push(tmpnode);
+						C_S_Inherit_relation[tmpnode] = C_S_Inherit_relation[Childpeeknode];
+						cwriteindex = C_Init_S_Queue_tail[Squeueindex][Squeueposindex];
+						C_Init_S_Queue[Squeueposindex][cwriteindex] = tmpnode;
+						C_Init_S_Queue_tail[Squeueindex][Squeueposindex]++;
 					}
 					else
 					{
@@ -697,13 +669,14 @@ __global__ void ChildPath(int ** G_sequence_Queue, int * taskindex, int * p2scc,
 					succ_num++;
 				}
 
-				Child_Init_S_queue[Squeueindex][Squeueposindex].pop();				
+				C_Init_S_Queue[Squeueposindex][creadindex] = -1;
+				C_Init_S_Queue_head[Squeueindex][Squeueposindex]++;
 			}
 		}
 
 		if(inblocktindex == 0)
 			iffinish = false;
-		cudaThreadSynchronize();
+		__syncthreads();
 
 		//calculate queuesize;
 		int cpbackindex[8];
@@ -713,7 +686,7 @@ __global__ void ChildPath(int ** G_sequence_Queue, int * taskindex, int * p2scc,
 			{
 				for(int i = 0; i < 32; i++)
 				{
-					queuesize += Child_Init_S_queue[j][i].count();
+					queuesize += (C_Init_S_Queue_tail[j][i] - C_Init_S_Queue_head[j][i]);;
 					cpbackindex[i]=queuesize;
 				}
 			}
@@ -764,24 +737,31 @@ __global__ void ChildPath(int ** G_sequence_Queue, int * taskindex, int * p2scc,
 			{
 				if(inblocktindex < WARP_T*4)
 				{
-					for(int m = 0; m < Child_Init_S_queue[Squeueindex][Squeueposindex].count(); m++)
+					int tcwriteindex = C_Init_S_Queue_tail[Squeueindex][Squeueposindex];
+					int tcreadindex = C_Init_S_Queue_head[Squeueindex][Squeueposindex];
+					for(int m = 0; m < tcreadindex-tcwriteindex; m++)
 					{
-						int tmpid =  Child_Init_S_queue[Squeueindex][Squeueposindex].front();
-						if(pathrecording[tmpid].tmppath.size() == 0)
+						cwriteindex = C_Init_S_Queue_tail[Squeueindex][Squeueposindex];
+						creadindex = C_Init_S_Queue_head[Squeueindex][Squeueposindex];
+						int tmpid =  C_Init_S_Queue[Squeueposindex][creadindex];
+						if(pathrecording[tmpid] == -1)
 						{
 							if(atomicExch(&G_pathrecMutex[tmpid], 1))
 							{
-								pathrecording[tmp].tmppath = S_pathrecord[tmp].tmppath;
-								atomicExch(&G_pathrecMutex[tmp], 0);
+								pathrecording[tmpid] = C_S_Inherit_relation[tmpid];
+								atomicExch(&G_pathrecMutex[tmpid], 0);
+								C_S_Inherit_relation[tmpid] = -1;
 							}
 							else
 							{
-								Child_Init_S_queue[Squeueindex][Squeueposindex].pop();
+								C_Init_S_Queue[Squeueposindex][creadindex] = -1;
+								C_Init_S_Queue_head[Squeueindex][Squeueposindex]++;
 								continue;
 							}
 						}
-						G_Queue.G_queue[blockIdx.x][cpbackindex[inblocktindex]+m] = Child_Init_S_queue[Squeueindex][Squeueposindex].front();    //not sure about if the memory copy will work,need confirm.
-						Child_Init_S_queue[Squeueindex][Squeueposindex].pop();
+						G_Queue.G_queue[blockIdx.x][cpbackindex[inblocktindex]+m] = C_Init_S_Queue[Squeueposindex][creadindex];    //not sure about if the memory copy will work,need confirm.
+						C_Init_S_Queue[Squeueposindex][creadindex]=-1;
+						C_Init_S_Queue_head[Squeueindex][Squeueposindex]++;
 					}
 				}
 				if(inblocktindex == 0)
@@ -794,25 +774,32 @@ __global__ void ChildPath(int ** G_sequence_Queue, int * taskindex, int * p2scc,
 			{
 				if(inblocktindex < WARP_T*4)
 				{
-					for(int m = 0; m< Child_Init_S_queue[Squeueindex][Squeueposindex].count(); m++)
+					int tcwriteindex = C_Init_S_Queue_tail[Squeueindex][Squeueposindex];
+					int tcreadindex = C_Init_S_Queue_head[Squeueindex][Squeueposindex];
+					for(int m = 0; m< tcwriteindex-tcreadindex; m++)
 					{
-						int tmpid =  Child_Init_S_queue[Squeueindex][Squeueposindex].front();
-						if(pathrecording[tmpid].tmppath.size() == 0)
+						cwriteindex = C_Init_S_Queue_tail[Squeueindex][Squeueposindex];
+						creadindex = C_Init_S_Queue_head[Squeueindex][Squeueposindex];
+						int tmpid =  C_Init_S_Queue[Squeueposindex][creadindex];
+						if(pathrecording[tmpid] == -1)
 						{
 							if(atomicExch(&G_pathrecMutex[tmpid], 1))
 							{
-								pathrecording[tmpid].tmppath = S_pathrecord[tmpid].tmppath;
+								pathrecording[tmpid] = C_S_Inherit_relation[tmpid];
 								atomicExch(&G_pathrecMutex[tmpid], 0);
+								C_S_Inherit_relation[tmpid]=-1;
 							}
 							else
 							{
-								Child_Init_S_queue[Squeueindex][Squeueposindex].pop();
+								C_Init_S_Queue[Squeueposindex][creadindex] = -1;
+								C_Init_S_Queue_head[Squeueindex][Squeueposindex]++;
 								continue;
 							}
 						}
-						int tmp = blockIdx.x % G_Queue.blockcount;
-						G_Queue.G_queue[m][Child_Queue_index[m]+cpbackindex[inblocktindex]+m] = Child_Init_S_queue[Squeueindex][Squeueposindex].front();
-						Child_Init_S_queue[Squeueindex][Squeueposindex].pop();
+						//int tmp = blockIdx.x % G_Queue.blockcount;
+						G_Queue.G_queue[m][Child_Queue_index[m]+cpbackindex[inblocktindex]+m] = C_Init_S_Queue[Squeueposindex][creadindex];
+						C_Init_S_Queue[Squeueposindex][creadindex] = -1;
+						C_Init_S_Queue_head[Squeueindex][Squeueposindex]++;
 					}
 				}
 				if(inblocktindex == 0)
@@ -832,53 +819,51 @@ __global__ void ChildPath(int ** G_sequence_Queue, int * taskindex, int * p2scc,
 	}
 }
 
+__device__ void partition(int* array, int left, int right, int * nleft, int *nright)
+{
+	int index = left;
+	int pivot = array[index];
+	int tmp;	
+	tmp = array[index];
+	array[index]=array[right];
+	array[right]=tmp;
+	for (int i=left; i<right; i++)
+	{
+		if (array[i] > pivot)
+		{    
+			tmp = array[index];
+			array[index++]=array[i];
+			array[i]=tmp;
+		}
+	}
+	tmp = array[right];
+	array[right]=array[index];
+	array[index]=tmp;
+	*nleft = index-1;
+	*nright = index+1;
+}
 
 //Cuda Quicksort
-__global__ void Gquicksort(int * data, int left, int right)
+__global__ void Gquicksort(int ** data, int left, int right)
 {
 	int nleft, nright;
 	cudaStream_t s1, s2;
 
-	partition(data, left, right, &nleft, &nright);
+	partition(*data, left, right, &nleft, &nright);
 
 	if(left < nright)
 	{
 		cudaStreamCreateWithFlags(&s1, cudaStreamNonBlocking);
-		Gquicksort<<<1,1,s1>>>(data, left, nright);
+		Gquicksort<<<1,1,0,s1>>>(data, left, nright);
 	}
 	if(nleft < right)
 	{
 		cudaStreamCreateWithFlags(&s2, cudaStreamNonBlocking);
-		Gquicksort<<<1,1,s2>>>(data, nleft, right);
+		Gquicksort<<<1,1,0,s2>>>(data, nleft, right);
 	}
 
-}
-void partition(int* array, int left, int right, int * nleft, int *nright)
-{
-	int index = left;
-	int pivot = array[index];	
-	swap(array[index], array[right]);
-	for (int i=left; i<right; i++)
-	{
-		if (array[i] > pivot)    
-			swap(array[index++], array[i]);
-	}
-	swap(array[right], array[index]);
-	*nleft = index-1;
-	*nright = index+1;
 }
 ////////////////////////
-
-string CudaIsfair(int fairnesstype, int sccsize, int * sccnodelist, int * evetlist, int ** outgoingtrainsition)
-{
-	TASKTYPE = 0;
-}
-
-__global__ void CudaUnion()
-{
-
-}
-
 
 
 //outtoing array: should add a -1 in the end of each array.
@@ -893,15 +878,19 @@ int * CudaPath(int initial_t, int sccsize,  int totalsize, int startID, int * sc
 	int * G_pathrecordingMutex, *H_pathcordingMutex;
 	Pathnode * G_pathrecording, *H_pathrecording;
 	//int * G_acceptlist;
-	int i;
+	int i=1;
 	size_t acturalsize;
 
 	string returnresult;
 
-	SCCSIZE = sccsize;
-	TOTALSIZE = totalsize;
-	TASKTYPE = 1;
-	INITIAL_T = initial_t;
+	cudaMemcpyToSymbol(&SCCSIZE, &sccsize, sizeof(int));
+	cudaMemcpyToSymbol(&TOTALSIZE,&totalsize, sizeof(int));
+	cudaMemcpyToSymbol(&TASKTYPE,&i,sizeof(int));
+	cudaMemcpyToSymbol(&INITIAL_T,&initial_t,sizeof(int));
+	//SCCSIZE = sccsize;
+	//TOTALSIZE = totalsize;
+	//TASKTYPE = 1;
+	//INITIAL_T = initial_t;
 
 	cudaGetDeviceCount(&deviceCount);
 	if(deviceCount == 0)
@@ -941,10 +930,10 @@ int * CudaPath(int initial_t, int sccsize,  int totalsize, int startID, int * sc
 	cudaStreamCreate(&counterexampleStream[0]);
 	cudaStreamCreate(&counterexampleStream[1]);
 	*/
-	dim3 blockparameterp(INITIAL_T,1,1);
+	dim3 blockparameterp(initial_t,1,1);
 	dim3 gridparameterp(1,1,1);
 	//int gridparameter = 1; optional
-	Gquicksort<<<1,1>>>(&sccnodelist, 0, SCCSIZE - 1);
+	Gquicksort<<<1,1>>>(&sccnodelist, 0, sccsize - 1);
 	cudaDeviceSynchronize();
 	//cudaSetDevice();  optional to use
 	GPath<<<blockparameterp, gridparameterp, 32>>>(startID, G_sccnodelist, G_outgoing, G_path2scc, G_pathrecording, G_pathrecordingMutex);
@@ -962,9 +951,9 @@ int * CudaFindshortestpath(int initial_t, int sccsize, int accsize, int totalsiz
 	int i;
 	size_t acturalsize;
 
-	SCCSIZE = sccsize;
-	TASKTYPE = 2;
-	INITIAL_T = initial_t;
+	//SCCSIZE = sccsize;
+	//TASKTYPE = 2;
+	//INITIAL_T = initial_t;
 
 	//NEED MODIFICATION : FIND SHORTEST PATH SHOULE ELIMATE NON-SCC in OUTGOING TO BUILD A SCCOUTGOING
 	cudaGetDeviceCount(&devicecount);
@@ -983,13 +972,13 @@ int * CudaFindshortestpath(int initial_t, int sccsize, int accsize, int totalsiz
 	cudaMemcpy(G_acceptlist,acclist,sizeof(int)*sccsize, cudaMemcpyHostToDevice);
 	cudaMemcpy2D(G_outgoing,acturalsize,outgoingtransition,sizeof(int)*outgoingwidth,outgoingwidth,totalsize,cudaMemcpyHostToDevice);
 
-	dim3 blockparameterp(INITIAL_T,1,1);
+	dim3 blockparameterp(initial_t,1,1);
 	dim3 gridparameterp(1,1,1);
 	//int gridparameter = 1; optional
 	Gquicksort<<<1,1>>>(&acclist, 0, accsize- 1);
 	cudaDeviceSynchronize();
 
-	GPath<<<blockparameterp,gridparameterp, 32>>>(startID, G_acceptlist, G_outgoing, G_path2acc);
+	//GPath<<<blockparameterp,gridparameterp, 32>>>(startID, G_acceptlist, G_outgoing, G_path2acc);
 	cudaMemcpy(H_path2acc, G_path2acc, sizeof(int)*sccsize, cudaMemcpyDeviceToHost);
 
 	return H_path2acc;
@@ -997,7 +986,7 @@ int * CudaFindshortestpath(int initial_t, int sccsize, int accsize, int totalsiz
 
 
 //test main
-void main()
+int main()
 {
 	int ** outgoing;
 	int * sccnlist;
@@ -1020,4 +1009,5 @@ void main()
 	}
 
 	result = CudaPath(8,3,31,0,sccnlist,outgoing,3);
+	return 1;
 }
