@@ -16,10 +16,14 @@ __constant__ int SCCSIZE;
 __constant__ int TOTALSIZE;
 __constant__ int TASKTYPE;
 __constant__ int WARP_T = 32;
-__constant__ int BLOCK_T = 512;
+__constant__ int MAX_THREAD_SMX = 2048;
+__constant__ int MAX_BLOCK_SMX = 16;
+__constant__ int MAX_BLOCK_THRESHOLD = 16;
+__constant__ int BLOCK_T = 1024;
 __constant__ int INITIAL_T;
-__constant__ int EXPAND_LEVEL = 4;
+__constant__ int EXPAND_LEVEL = 4; 
 __constant__ int BLOCK_SYN_THRESHOLD = 8;
+
 
 
 //class Gqueue for global memeory access
@@ -38,7 +42,11 @@ public:
 	~GQueue(){}
 };
 
-
+class PathNode{
+public:
+	int presucc;
+	int selfid;
+};
 /***************Global variant****************/
 __device__ GQueue G_Queue;
 __device__ bool G_ifsccReach;
@@ -148,90 +156,98 @@ __device__ void BSearchIfreach(bool * theresult, int * searchlist, int size, int
 __global__ void ChildPath(int **, int *, int *, int *, int **, int *, int * ); 
 __global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, int * pathrecording, int * G_pathrecMutex)  //for optimization, if outgoing is not very big, it can be stored in the specific memory in kepler
 {
-	int threadindex = blockIdx.x * blockDim.x + threadIdx.x;
-	int inblocktid = threadindex;
-	int Squeueindex,Squeueposindex;
-
-	__shared__ int Init_S_Queue_head[4][32];
-	__shared__ int Init_S_Queue_tail[4][32];
+	int inblocktid = threadIdx.x;
 
 	int i,j;
-	for(i=0;i<32;i++)
-	{
-		for(j=0;j<4;j++)
-		{
-			Init_S_Queue_head[j][i] = j*(TOTALSIZE-SCCSIZE);
-			Init_S_Queue_tail[j][i] = j*(TOTALSIZE-SCCSIZE);
-		}
-	}
+	int tmpwcount,tmpqcount;
+	int MAX_QUEUE_SIZE;
+	int QUEUE_AVAI_LENGTH,SUCC_SIZE;
+	int WARPSIZE;
+	int tmpnode,peeknode;
+	int succ_num = 0;
+	int relationindex;
+	int writeindex, readindex;
+	PathNode precord;
+	int averagetask, inblockwarpnum;
 
-	extern __shared__ int S[];
-	//__shared__ int * S_Pathrecord = S;
-	__shared__ int * S_Inherit_relation = S;  
-	if(threadindex == 0)
-	{
-		for(i = 0; i< (TOTALSIZE-SCCSIZE); i++)
-		{	
-			//S_pathrecord[i].Nid = i;
-			S_Inherit_relation[i] = -1;
-		}
- 	}
+	int tmpcount = 0;
+	int tmp;
+	int tmpstart, tmpend;
 
-	__shared__ int *pathrecordmutex = &S_Inherit_relation[TOTALSIZE-SCCSIZE];
-	
-	if(threadindex == 0)
-	{
-		for(i = 0; i< TOTALSIZE-SCCSIZE; i++)
-		{	
-			pathrecordmutex[i] = 0;
-		}
-	}
-	__shared__ int * Init_S_Queue[32];
-    //__shared__ int Init_S_queue[32][4*(TOTALSIZE-SCCSIZE)];
-	if(threadindex == 0)
-	{
-		Init_S_Queue[0]= &pathrecordmutex[TOTALSIZE-SCCSIZE];
-		for(i = 0; i < 4*(TOTALSIZE-SCCSIZE); i++) 
-		{
-			Init_S_Queue[0][i] = -1;
-		}
-		for(i = 1; i<32; i++)
-		{
-			Init_S_Queue[i]= &Init_S_Queue[i-1][i*(TOTALSIZE-SCCSIZE)*4];
-			for(j = 0; j < 4*(TOTALSIZE-SCCSIZE); j++) 
-			{
-				Init_S_Queue[i][j] = -1;
-			}
-		}
-	}
-	
-	__syncthreads();
-
+	__shared__ bool ifinblockadjustment;
+	__shared__ bool ifinwarpimbalance;
 	__shared__ int queuesize;
 	__shared__ bool ifexpand;
 	__shared__ bool ifSccReach;
 	__shared__ unsigned int path2sccmutex;
 	__shared__ bool iffinish;
 
-	int tmpnode;
-	//bool ifnew;
+	__shared__ int Init_S_Queue_head[32];  
+	__shared__ int Init_S_Queue_tail[32];
+	__shared__ int Init_S_Queue_indexbackup[32];
+	__shared__ int S_pathrecord_head[32];
+	__shared__ int S_pathrecord_tail[32]; //no need backup for parent
+	__shared__ int inblockexceednum[32];
+	__shared__ int inblockavailength[32];
 
-	Squeueindex = (inblocktid/32+1)%3;
-	Squeueposindex = inblocktid % 31;
-	int writeindex, readindex;
+	
+	if(inblocktid == 0)
+	{
+		for(i=0;i<32;i++)
+		{
+			inblockexceednum[j] = 0;
+			Init_S_Queue_head[i] = 0;
+			Init_S_Queue_tail[i] = 0;
+			Init_S_Queue_indexbackup[i] = 0;
+		}
+	}
+	
+	extern __shared__ int S[];
+	
+	__shared__ int * Init_S_Queue[32];
+    
+	if(inblocktid == 0)
+	{
+		Init_S_Queue[0]= S;
+		for(i = 0; i < WARP_T; i++) 
+		{
+			for(j = 0;j < WARP_T; j++)
+				Init_S_Queue[i][j] = -1;
+		}
+		for(i = 1; i<WARP_T; i++)
+		{
+			Init_S_Queue[i]= &Init_S_Queue[i-1][WARP_T];
+			for(j = 0; j < WARP_T; j++) 
+			{
+				Init_S_Queue[i][j] = -1;
+			}
+		}
+	}
+
+	__shared__ PathNode * S_Precord_Queue[2*32];
+	if(inblocktid == 0)
+	{
+		S_Precord_Queue[0] = &S_Precord_Queue[31][WARP_T];
+		for(i=1; i<2*WARP_T;i++)
+		{
+			S_Precord_Queue[i] = &S_Precord_Queue[i-1][WARP_T];
+		}
+	}
+	__syncthreads();
+
 
 	if(inblocktid == 0)
 	{
 		BSearchIfreach(&ifSccReach,scc,SCCSIZE, startid);
 		if(!ifSccReach)
 		{
-			writeindex = Init_S_Queue_tail[Squeueindex][Squeueposindex];
-			Init_S_Queue[Squeueposindex][writeindex]=startid;
-			Init_S_Queue_tail[Squeueindex][Squeueposindex]++; //move head tail, need modification in the S_queue part.
+			Init_S_Queue[0][0]=startid;
+			Init_S_Queue_tail[0]++; //move head tail, need modification in the S_queue part.
 
 			queuesize = 1;
 			ifexpand = false;
 			ifSccReach = false;
+			ifinblockadjustment = false;
 			path2sccmutex = 0;
 		}
 
@@ -242,33 +258,50 @@ __global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, i
 	if(!ifSccReach)
 	{
 		do{
-			if(threadindex < queuesize)
+			if(inblocktid < queuesize)
 			{
-				readindex = Init_S_Queue_head[Squeueindex][Squeueposindex];
-				int peeknode = Init_S_Queue[Squeueposindex][readindex];
+				readindex = Init_S_Queue_head[inblocktid];
+				peeknode = Init_S_Queue[inblocktid][readindex];
 			
 				if(peeknode != -1)
 				{
-					int succ_num = 0;
-					int relationindex;
+					succ_num = 0;
+					relationindex;
 				
 					//judge if belong to scc(sorted)
 					BSearchIfreach(&ifSccReach,scc,SCCSIZE, peeknode);
 
 					if(ifSccReach == true)
 					{
+						for(i=0;i<S_pathrecord_tail[inblocktid];i++)
+						{
+							precord = S_Precord_Queue[inblocktid][i];
+							if(pathrecording[precord.selfid]!=-1)
+								continue;
+							else
+							{
+								if(atomicExch(&G_pathrecMutex[precord.selfid],1))
+								{
+									pathrecording[precord.selfid] = precord.presucc;
+									atomicExch(&G_pathrecMutex[precord.selfid],0);
+								}
+								else
+									continue;
+							}
+						}
+
 						while(!iffinish)  
 						{  
 							if(atomicExch(&path2sccmutex, 1))   //use lock to modify the path2scc
 							{
 								path2scc[0] = peeknode;
 								relationindex = peeknode;
-								for(i=1; S_Inherit_relation[relationindex] != startid; i++)
+								for(i=1; pathrecording[relationindex] != startid; i++)
 								{
-									path2scc[i] = S_Inherit_relation[relationindex];
+									path2scc[i] = pathrecording[relationindex];
 									relationindex = path2scc[i];
 								}
-
+								path2scc[i] = startid;
 								iffinish = true;
 								atomicExch(&path2sccmutex, 0);
 							}
@@ -276,57 +309,151 @@ __global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, i
 						break;
 					}
 
-					while(outgoing[peeknode][succ_num] != -1)
+					
+					readindex = Init_S_Queue_head[inblocktid];
+					writeindex = Init_S_Queue_tail[inblocktid];
+					QUEUE_AVAI_LENGTH = WARP_T-(writeindex-readindex+WARP_T)%WARP_T;
+
+					while(outgoing[peeknode][succ_num] > 0)
 					{					
-
-						tmpnode = outgoing[peeknode][succ_num];
-						if(atomicExch(&pathrecordmutex[tmpnode], 1))
+						SUCC_SIZE = outgoing[peeknode][0];
+						if(SUCC_SIZE < QUEUE_AVAI_LENGTH)
 						{
-							if(S_Inherit_relation[tmpnode] != -1)
-							{
-								atomicExch(&path2sccmutex, 0);
-								succ_num++;
-								continue;
-							}
-							S_Inherit_relation[tmpnode] = peeknode;
-							writeindex = Init_S_Queue_tail[Squeueindex][Squeueposindex];
-							atomicExch(&path2sccmutex, 0);
+							tmpnode = outgoing[peeknode][succ_num+1];
+							
+							(S_Precord_Queue[inblocktid][S_pathrecord_tail[inblocktid]]).selfid = tmpnode;
+							(S_Precord_Queue[inblocktid][S_pathrecord_tail[inblocktid]]).presucc = peeknode;
 
-							Init_S_Queue[Squeueposindex][writeindex] = tmpnode;
-							Init_S_Queue_tail[Squeueindex][Squeueposindex]++;
+							S_pathrecord_tail[inblocktid]++;
+
+							writeindex = Init_S_Queue_tail[inblocktid];
+
+							Init_S_Queue[inblocktid][writeindex] = tmpnode;
+							if(Init_S_Queue_tail[inblocktid]++ == WARP_T)
+							{
+								Init_S_Queue_tail[inblocktid] -= WARP_T;
+							}
+										
+							succ_num++;
 						}
 						else
 						{
-							//ifnew = false;
-							succ_num++;
-							continue;
+							ifinblockadjustment = true;   //if use atomic operation?
+							inblockexceednum[inblocktid] = SUCC_SIZE; 
+							inblockavailength[inblocktid] = QUEUE_AVAI_LENGTH;
+							break;
 						}
-												
-						succ_num++;
+						inblockexceednum[inblocktid]= succ_num-1-QUEUE_AVAI_LENGTH;  //HOW TO adujustment inblock
+						inblockavailength[inblocktid] = QUEUE_AVAI_LENGTH-succ_num-1;
+
 					}
-					Init_S_Queue_head[Squeueindex][Squeueposindex]++;
+
+					if(!ifinblockadjustment)
+					{
+						Init_S_Queue[inblocktid][readindex] = -1;
+						if(Init_S_Queue_head[inblocktid]++ == WARP_T)
+						{
+							Init_S_Queue_head[inblocktid]-= WARP_T;
+						}
+					}
 				}			
 			}
-			if(threadindex == 0)
+
+			if(inblocktid == 0)
+			{
 				iffinish = false;
-	
+				if(!ifinblockadjustment)
+				{
+					for(i = 0;i < WARP_T; i++)
+					{
+						if((Init_S_Queue_tail[i]-Init_S_Queue_head[i]+WARP_T)%WARP_T == 0)
+						{
+							for(j=0; j < WARP_T; j++)
+							{
+								if((Init_S_Queue_tail[i]-Init_S_Queue_head[i]+WARP_T)%WARP_T > 1)
+								{
+									Init_S_Queue[i][Init_S_Queue_tail[i]++] = Init_S_Queue[j][Init_S_Queue_tail[j]--];
+									Init_S_Queue_tail[j] = (Init_S_Queue_tail[j]+WARP_T)%WARP_T;
+									break;
+								}
+							}
+						}
+					}	
+				}
+			}
+
 			__syncthreads();
 
 			if(inblocktid == 0)
 			{
+				queuesize = 0;
 				for(i = 0; i < 32; i++)
 				{
-					for(j = 0; j < 4; j++)
-						queuesize += (Init_S_Queue_tail[j][i] - Init_S_Queue_head[j][i]);
+					queuesize += (Init_S_Queue_tail[i] - Init_S_Queue_head[i] + WARP_T)%WARP_T;
 				}
 				if(queuesize > INITIAL_T)
+				{
 					ifexpand = true;
+				}
+				else
+				{					
+					if(ifinblockadjustment == true)   //inblock adjustment
+					{
+						for(i = 0;i<32;i++)
+						{	
+							succ_num = 1;
+							tmpqcount=0;
+							if(inblockexceednum[i] > 0)
+							{
+								readindex = Init_S_Queue_head[i];
+								peeknode = Init_S_Queue[i][readindex];
+								while((tmpnode=outgoing[tmpnode][succ_num]) != -1)
+								{
+									while(true)
+									{
+										if(inblockavailength[tmpqcount] > WARP_T/2) //balance inblock while exceed;
+										{
+											writeindex = Init_S_Queue_tail[tmpqcount];
+											Init_S_Queue[tmpqcount][writeindex] = tmpnode;
+											if(Init_S_Queue_tail[tmpqcount]++ == WARP_T)
+											{
+												Init_S_Queue_tail[tmpqcount] -= WARP_T;
+											}
+											succ_num++;
+											inblockavailength[tmpqcount]--;
+											break;
+										}
+										else
+										{
+											tmpqcount++;
+											if(tmpqcount == 31)
+											{											
+												tmpqcount = 0;
+
+											}
+										}
+									}
+								}
+								
+							}
+						}
+					}
+
+				
+					queuesize = 0;
+					for(i = 0; i < 32; i++)
+					{
+						queuesize += (Init_S_Queue_tail[i] - Init_S_Queue_head[i] + WARP_T)%WARP_T;
+					}
+					if(queuesize > INITIAL_T)
+						ifexpand = true;
+				}
 			}
 			__syncthreads();
 		}while(ifexpand);
 
 		int expandedtasksize = 0;
-		int childbsize = 0;
+		int childbsize = 0;  
 
 		if(!ifSccReach && inblocktid == 0)
 		{
@@ -335,12 +462,16 @@ __global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, i
 
 			expandedtasksize = queuesize;
 
-			childbsize = expandedtasksize / WARP_T + 1;
+			if(expandedtasksize % WARP_T == 0)
+				childbsize = expandedtasksize/WARP_T;
+			else
+				childbsize = expandedtasksize/WARP_T + 1;
+
 			G_Queue.G_queue = new int * [childbsize];
 			G_Queue.G_queue_size = new int [childbsize];
 			G_Queue.blockcount = childbsize;
 
-			for(int j=0; j<childbsize; j++)
+			for(j=0; j<childbsize; j++)
 			{
 				if(TASKTYPE == 1)
 					G_Queue.G_queue[j] = new int[TOTALSIZE-SCCSIZE]; //queue stored in Global Queue
@@ -349,116 +480,144 @@ __global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, i
 				G_Queue.G_queue_size[j] = 0;
 			}
 		
-			int tmpcount = 0;
-			int tmp;
-			int tmpstart, tmpend;
-			for(int i = 0; i < 4; i++)
+			for(i = 0; i < 32; i++)
 			{
-				for(int j = 0; j < 32; j++)
+				while(S_pathrecord_head[i] != S_pathrecord_tail[i])
 				{
-					readindex = Init_S_Queue_head[i][j];
-					writeindex = Init_S_Queue_tail[i][j];
-					for(int m = 0; m < writeindex-readindex; m++)
+					precord = S_Precord_Queue[i][S_pathrecord_head[i]++];
+					if(pathrecording[precord.selfid] != -1)
+						continue;
+					else
+						pathrecording[precord.selfid] = precord.presucc;
+				}
+				precord = S_Precord_Queue[i][S_pathrecord_tail[i]];
+				if(pathrecording[precord.selfid] == -1)
+					pathrecording[precord.selfid] = precord.presucc;
+
+				S_pathrecord_head[i] = 0;
+				S_pathrecord_tail[i] = 0;
+			}
+
+			for(j = 0; j < 32; j++)
+			{
+				readindex = Init_S_Queue_head[j];
+				writeindex = Init_S_Queue_tail[j];
+				for(int m = 0; m < ((writeindex - readindex + WARP_T) % WARP_T); m++)
+				{
+					tmpstart = Init_S_Queue_head[j];
+					tmpend = Init_S_Queue_tail[j];
+					tmp = Init_S_Queue[j][tmpstart];
+					if(pathrecording[tmp] != -1)
 					{
-						tmpstart = Init_S_Queue_head[i][j];
-						tmpend = Init_S_Queue_tail[i][j];
-						tmp = Init_S_Queue[j][tmpstart];
-						if(pathrecording[tmp] != -1)
-						{
-							if(atomicExch(&G_pathrecMutex[tmp], 1))
-							{
-								pathrecording[tmp] = S_Inherit_relation[tmp];
-								
-								atomicExch(&path2sccmutex, 0);
-								S_Inherit_relation[tmp] = -1;
-							}
-							else
-							{
-								Init_S_Queue_head[i][j]++;
-								tmpcount++;
-								tmpcount=tmpcount%(childbsize-1);
-								continue;
-							}
-							G_Queue.G_queue[tmpcount][G_Queue.G_queue_size[tmpcount]] = Init_S_Queue[j][tmpstart];    //not sure about if the memory copy will work,need confirm.
-							G_Queue.G_queue_size[tmpcount]++;
-						}
-						Init_S_Queue_head[i][j]++;
+						if(Init_S_Queue_head[j]++ == WARP_T)
+							Init_S_Queue_head[j] -= WARP_T;
 						tmpcount++;
 						tmpcount=tmpcount%(childbsize-1);
-						
+						continue;				
 					}
+					G_Queue.G_queue[tmpcount][G_Queue.G_queue_size[tmpcount]] = Init_S_Queue[j][tmpstart];    //not sure about if the memory copy will work,need confirm.
+					G_Queue.G_queue_size[tmpcount]++;
+
+					if(Init_S_Queue_head[j]++ == WARP_T)
+						Init_S_Queue_head[j] -= WARP_T;
+					tmpcount++;
+					tmpcount=tmpcount%(childbsize-1);
+						
 				}
 			}
+			
 		}
 
 		__syncthreads();
 	
 		int expandtime = 1;
-		queuesize = 0;
+		int averagetask, lastblocktask;
 		while(!G_ifsccReach && !ifSccReach)
 		{
 			//this can be expanded to two version, one is iterative, the other is recursive!
-			bool ifneedsyn = false;    
+			bool ifneedsyn = false;
+			queuesize = 0;
 
 			//rearrange tasks
 			if(inblocktid == 0)
 			{
-				if(expandtime > 1)  
+				if(expandtime == 1)
 				{
 					P_taskd_index = new int[childbsize + 1];   //add 1 is for the end of the last block
+					P_taskd_index[0] = 0;
 					for(int i = 0; i < G_Queue.blockcount + 1; i++)
 					{
 						queuesize += G_Queue.G_queue_size[i];
-						P_taskd_index[i] = queuesize;
+						P_taskd_index[i+1] = queuesize;
+					}
+					P_G_sequence_index = new  int * [queuesize];
+					for(i=0;i<childbsize;i++)
+						P_G_sequence_index[P_taskd_index[i]] = G_Queue.G_queue[i];
+				}
+				else
+				{
+					for(int i = 0; i < G_Queue.blockcount + 1; i++)
+					{
+						queuesize += G_Queue.G_queue_size[i];
+					}
+					expandedtasksize = queuesize;
+					if((childbsize=expandedtasksize/WARP_T) < MAX_BLOCK_THRESHOLD)  //here max block threshold is not static, it is based on GPU architecture.
+					{
+						averagetask = WARP_T;
+						if(expandedtasksize % WARP_T == 0)
+						{
+							childbsize = expandedtasksize/WARP_T;
+							lastblocktask = 0;
+						}
+						else
+						{
+							childbsize = expandedtasksize/WARP_T + 1;
+							lastblocktask = expandedtasksize % WARP_T;
+						}
+						inblockwarpnum = averagetask * EXPAND_LEVEL;
+					}
+					else
+					{
+						averagetask = 2*WARP_T;
+						while((childbsize=expandedtasksize/averagetask) > MAX_BLOCK_THRESHOLD)
+						{
+							averagetask += WARP_T;
+						}
+						lastblocktask = expandedtasksize % averagetask;
+						inblockwarpnum = averagetask * EXPAND_LEVEL;   //it is possible that the warp num exceed the limit.
+					}
+
+					P_taskd_index = new int[childbsize + 1];
+					for(i=0; i<childbsize;i++)
+					{
+						P_taskd_index[i] = i*averagetask;
+					}
+					if(lastblocktask != 0)
+						P_taskd_index[i+1] = i*averagetask + lastblocktask;
+					else
+						P_taskd_index[i+1] = 0;
+
+					P_G_sequence_index = new  int * [expandedtasksize];
+					P_G_sequence_index[0] = G_Queue.G_queue[0];
+					for(i = 0, j = 0; i < G_Queue.blockcount - 1; i++)
+					{
+						j += G_Queue.G_queue_size[i];
+						P_G_sequence_index[j] = G_Queue.G_queue[i+1];
 					}
 				}
-				P_G_sequence_index = new  int * [queuesize];
-				expandedtasksize = queuesize;
+			
 			}
+			__syncthreads();
 
-			if(inblocktid < childbsize)
-			{
-				int beginindex = P_taskd_index[inblocktid];
-				/*for(int i=0; i<G_Queue.G_queue_size[threadindex]; i++)
-				{
-				P_G_sequence_index[i+beginindex] = &G_Queue.G_queue[threadindex][i];
-				}*/
-				//if array are sequential stored then:
-				P_G_sequence_index[beginindex] = G_Queue.G_queue[inblocktid];
-			}
-			if(childbsize > BLOCK_T)    //adjust the map between virtual P_G_Quene to G_queue; 
-			{
-				int beginindex, leftsize;
-				for(int j = 0; j<childbsize/BLOCK_T; j++)
-				{
-					beginindex = P_taskd_index[j*BLOCK_T + inblocktid];
-					P_G_sequence_index[beginindex] = G_Queue.G_queue[j*BLOCK_T + inblocktid];
-				}
-				leftsize = childbsize % BLOCK_T;
-				if(inblocktid < leftsize)
-					P_G_sequence_index[P_taskd_index[(childbsize/BLOCK_T)*BLOCK_T + inblocktid]] = G_Queue.G_queue[(childbsize/BLOCK_T)*BLOCK_T + inblocktid];
-			}
 			////////////////////////////////
 	
-			if(inblocktid == 0)
+			if(inblocktid == 0)  //if add warp in a single block or in mutiple blokcs is needed to eveluate.
 			{
-				int averagetask = expandedtasksize/childbsize + 1;
-				if(averagetask > WARP_T)
-				{
-					childbsize = expandedtasksize/WARP_T + 1;
-					averagetask = expandedtasksize/childbsize + 1;
-				}
-
-				for(int i=0; i<childbsize + 1; i++) 
-				{
-					P_taskd_index[i] = i*averagetask;
-				}
-
 				if(childbsize > 1)
 				{
 					Arrayin = new int[childbsize];
 					Arrayout = new int[childbsize];
-					ChildPath<<<(EXPAND_LEVEL*(averagetask)), childbsize>>>(startid,P_G_sequence_index, P_taskd_index, path2scc,scc,outgoing, pathrecording, G_pathrecMutex);
+					ChildPath<<<inblockwarpnum, childbsize>>>(startid,P_G_sequence_index, P_taskd_index, path2scc,scc,outgoing, pathrecording, G_pathrecMutex);
 					cudaDeviceSynchronize();
 				}
 				else
@@ -470,10 +629,11 @@ __global__ void GPath(int startid, int * scc, int ** outgoing, int * path2scc, i
 				}
 				//call child path,how to combine each block to just one SM?
 			
-				expandtime++;
+				
 				expandedtasksize = 0;
 				ifneedsyn = true;
 			}
+			expandtime++;
 
 			if(ifneedsyn)
 				__syncthreads();
@@ -488,24 +648,73 @@ __global__ void ChildPath(int startid, int ** G_sequence_Queue, int * taskindex,
 	int Squeueindex, Squeueposindex;
 	int i,j;
 	////////////////////////////
+
+	int i,j;
+	int tmpwcount,tmpqcount;
+	int MAX_QUEUE_SIZE;
+	int QUEUE_AVAI_LENGTH,SUCC_SIZE;
+	int SELF_WARP;
+	int tmpnode;
+	int succ_num = 1;
+	int relationindex;
+	int cwriteindex, creadindex;
+
+	int duration=taskindex[blockIdx.x + 1] - taskindex[blockIdx.x];
+	int goalVal = 0; //used for synamong blocks
+
+	int Childpeeknode;
+
+	Squeueindex = inblocktindex/32;
+	Squeueposindex = inblocktindex % 31;
+
+	__shared__ int queuesize;
+	__shared__ bool ifSccReach;
+	__shared__ bool iffinish;
+	__shared__ unsigned int C_path2sccmutex;
 	__shared__ int C_Init_S_Queue_head[4][32];
 	__shared__ int C_Init_S_Queue_tail[4][32];
-	for(i=0;i<32;i++)
+	__shared__ int C_Init_S_Queue_indexbackup[4][32];
+	__shared__ int inblockexceednum[4][32];
+	__shared__ int inblockavailength[4][32];
+
+	__shared__ int WARPMUTEX[4];
+	__shared__ bool WARPOCCUPY[4];
+	if(inblocktindex == 0)
 	{
-		for(j=0;j<4;j++)
+		for(i = 0;i<4;i++)
 		{
-			C_Init_S_Queue_head[j][i] = j*(TOTALSIZE-SCCSIZE);
-			C_Init_S_Queue_tail[j][i] = j*(TOTALSIZE-SCCSIZE);
+			WARPMUTEX[i] = 0;
+			WARPOCCUPY[i] = false;
+		}
+	}
+
+	if(blockDim.x < 32*128)
+	{
+		MAX_QUEUE_SIZE = WARP_T;
+	}
+	else
+		MAX_QUEUE_SIZE = (blockDim.x/128+1)*2;
+
+	if(inblocktindex == 0)
+	{
+		for(i=0;i<32;i++)
+		{
+			for(j=0;j<4;j++)
+			{
+				C_Init_S_Queue_head[j][i] = j*(MAX_QUEUE_SIZE);
+				C_Init_S_Queue_tail[j][i] = j*(MAX_QUEUE_SIZE);
+				C_Init_S_Queue_indexbackup[i][j] = j*(MAX_QUEUE_SIZE);
+				inblockexceednum[j][i] = 0;
+			}
 		}
 	}
 	extern __shared__ int C[];
-	//__shared__ int * S_Pathrecord = S;
-	__shared__ int * C_S_Inherit_relation = C;  
+	__shared__ int * C_S_Inherit_relation = C; //path recording
+
 	if(inblocktindex == 0)
 	{
 		for(i = 0; i< (TOTALSIZE-SCCSIZE); i++)
 		{	
-			//S_pathrecord[i].Nid = i;
 			C_S_Inherit_relation[i] = -1;
 		}
 	}
@@ -520,42 +729,66 @@ __global__ void ChildPath(int startid, int ** G_sequence_Queue, int * taskindex,
 		}
 	}
 	__shared__ int * C_Init_S_Queue[32];
-	//__shared__ int Init_S_queue[32][4*(TOTALSIZE-SCCSIZE)];
+	
 	if(inblocktindex == 0)
 	{
-		C_Init_S_Queue[0]= &pathrecordmutex[TOTALSIZE-SCCSIZE];
-		for(i = 0; i < 4*(TOTALSIZE-SCCSIZE); i++) 
+		C_Init_S_Queue[0]= &pathrecordmutex[MAX_QUEUE_SIZE];
+		for(i = 0; i < 4*(MAX_QUEUE_SIZE); i++) 
 		{
 			C_Init_S_Queue[0][i] = -1;
 		}
 		for(i = 1; i<32; i++)
 		{
-			C_Init_S_Queue[i]= &C_Init_S_Queue[i-1][i*(TOTALSIZE-SCCSIZE)*4];
-			for(j = 0; j < 4*(TOTALSIZE-SCCSIZE); j++) 
+			C_Init_S_Queue[i]= &C_Init_S_Queue[i-1][i*(MAX_QUEUE_SIZE)*4];
+			for(j = 0; j < 4*(MAX_QUEUE_SIZE); j++) 
 			{
 				C_Init_S_Queue[i][j] = -1;
 			}
 		}
 	}
-	///////////////////////////////////
-	__syncthreads();
-       
-	__shared__ int queuesize;
-	__shared__ bool ifSccReach;
-	__shared__ bool iffinish;
-	__shared__ unsigned int C_path2sccmutex;
 
-
-	int duration=taskindex[blockIdx.x + 1] - taskindex[blockIdx.x];
-	int goalVal = 0;
-
-	int Childpeeknode;
+	__shared__ int *WARP_Schedule = &C_Init_S_Queue[31][3];
+	if(inblocktindex == 0)
+	{
+		if(j % WARP_T ==0)
+			j = blockDim.x / WARP_T;
+		else
+			j = blockDim.x /WARP_T + 1;
+		for(i = 0; i < j; i++)
+		{
+			WARP_Schedule[i] = -1;
+		}
+	}
 
 	if(inblocktindex == 0)
 	{
 		queuesize = duration;
 		ifSccReach = false;
 	}
+///////////////////////////////////
+	__syncthreads();
+	
+	/*if(inblocktindex % (WARP_T-1) == 0)
+	{
+		for(i=0;i<4;i++)
+		{
+			if(WARPOCCUPY[i] == true )
+				continue;
+			else
+			{
+				if(atomicExch(&WARPMUTEX[tmp], 1))
+				{
+					pathrecording[tmp] = S_Inherit_relation[tmp];
+
+					atomicExch(&G_pathrecMutex, 0);
+					S_Inherit_relation[tmp] = -1;
+				}
+			}
+		}
+	}
+*/
+       
+	
 	if(globalthreadindex == 0)
 	{
 		Child_syn_need = false;
@@ -569,9 +802,10 @@ __global__ void ChildPath(int startid, int ** G_sequence_Queue, int * taskindex,
 	else
 		__gpu_blocks_tree_syn(goalVal++, Arrayin, Arrayout);
 	
-	Squeueindex = inblocktindex/32;
-	Squeueposindex = inblocktindex % 31;
-	int cwriteindex, creadindex;
+
+
+	//add warpdecision process
+
 	while(!G_ifsccReach && !Child_need_back2parent)
 	{
 		//copy data from global memory to shared memory
@@ -603,8 +837,7 @@ __global__ void ChildPath(int startid, int ** G_sequence_Queue, int * taskindex,
 			Childpeeknode = C_Init_S_Queue[Squeueposindex][creadindex];
 			if(Childpeeknode)
 			{
-				int succ_num = 0;
-				int relationindex;
+				succ_num = 1;
 				BSearchIfreach(&ifSccReach, scc, SCCSIZE, Childpeeknode);
 
 				if(ifSccReach == true)
@@ -638,39 +871,60 @@ __global__ void ChildPath(int startid, int ** G_sequence_Queue, int * taskindex,
 					break;
 				}
 
-				int tmpnode;
+				creadindex = C_Init_S_Queue_head[Squeueindex][Squeueposindex];
+				cwriteindex = C_Init_S_Queue_tail[Squeueindex][Squeueposindex];
+				QUEUE_AVAI_LENGTH = MAX_QUEUE_SIZE - (cwriteindex-creadindex+MAX_QUEUE_SIZE)%MAX_QUEUE_SIZE;
+				SCCSIZE = outgoing[Childpeeknode][0];
 
 				while(outgoing[Childpeeknode][succ_num] != -1)
 				{
 					//int pathcount = 0;
 					//bool ifnewjudge = true;
-
-					tmpnode = outgoing[Childpeeknode][succ_num];
-					if(atomicExch(&pathrecordmutex[tmpnode], 1))
+					if(SCCSIZE > QUEUE_AVAI_LENGTH)
 					{
-						if(C_S_Inherit_relation[tmpnode] != -1)
+						tmpnode = outgoing[Childpeeknode][succ_num];
+						if(atomicExch(&pathrecordmutex[tmpnode], 1))
 						{
-							atomicExch(&pathrecordmutex[tmpnode], 0);
+							if(C_S_Inherit_relation[tmpnode] != -1)
+							{
+								atomicExch(&pathrecordmutex[tmpnode], 0);
+								succ_num++;
+								continue;
+							}
+							C_S_Inherit_relation[tmpnode] = C_S_Inherit_relation[Childpeeknode];
+							cwriteindex = C_Init_S_Queue_tail[Squeueindex][Squeueposindex];
+							C_Init_S_Queue[Squeueposindex][cwriteindex] = tmpnode;
+					
+							if(C_Init_S_Queue_tail[Squeueindex][Squeueposindex]++ == C_Init_S_Queue_indexbackup[Squeueindex+1][Squeueposindex])
+							{
+								C_Init_S_Queue_tail[Squeueindex][Squeueposindex] -= MAX_QUEUE_SIZE;
+							}
+						}
+						else
+						{
+							//ifnew = false;
 							succ_num++;
 							continue;
 						}
-						C_S_Inherit_relation[tmpnode] = C_S_Inherit_relation[Childpeeknode];
-						cwriteindex = C_Init_S_Queue_tail[Squeueindex][Squeueposindex];
-						C_Init_S_Queue[Squeueposindex][cwriteindex] = tmpnode;
-						C_Init_S_Queue_tail[Squeueindex][Squeueposindex]++;
+
+						succ_num++;
 					}
 					else
 					{
-						//ifnew = false;
-						succ_num++;
-						continue;
+						ifinblockadjustment = true;   //if use atomic operation?
+						inblockexceednum[Squeueindex][Squeueposindex] = SUCC_SIZE; 
+						inblockavailength[Squeueindex][Squeueposindex] = QUEUE_AVAI_LENGTH;
+						break;
 					}
-
-					succ_num++;
+					inblockexceednum[Squeueindex][Squeueposindex]= succ_num-1-QUEUE_AVAI_LENGTH;  //HOW TO adujustment inblock
+					inblockavailength[Squeueindex][Squeueposindex] = QUEUE_AVAI_LENGTH-succ_num-1;
 				}
 
 				C_Init_S_Queue[Squeueposindex][creadindex] = -1;
-				C_Init_S_Queue_head[Squeueindex][Squeueposindex]++;
+				if(C_Init_S_Queue_head[Squeueindex][Squeueposindex]++ == C_Init_S_Queue_indexbackup[Squeueindex+1][Squeueposindex])
+				{
+					C_Init_S_Queue_head[Squeueindex][Squeueposindex]-= MAX_QUEUE_SIZE;
+				}
 			}
 		}
 
@@ -679,19 +933,82 @@ __global__ void ChildPath(int startid, int ** G_sequence_Queue, int * taskindex,
 		__syncthreads();
 
 		//calculate queuesize;
-		int cpbackindex[8];
+		int cpbackindex[4][32];
+		int indexcount=0;
 		if(inblocktindex == 0)
 		{
 			for(int j = 0; j < 4; j++)
 			{
 				for(int i = 0; i < 32; i++)
 				{
-					queuesize += (C_Init_S_Queue_tail[j][i] - C_Init_S_Queue_head[j][i]);;
-					cpbackindex[i]=queuesize;
+					queuesize += ((C_Init_S_Queue_tail[j][i] - C_Init_S_Queue_head[j][i]+MAX_QUEUE_SIZE)%MAX_QUEUE_SIZE);
+					cpbackindex[indexcount]=queuesize;
+					indexcount++;
 				}
 			}
 			if(queuesize > blockDim.x)
 				Child_syn_need = true;
+			else
+			{
+				if(ifinblockadjustment == true)   //inblock adjustment
+				{
+					for(i = 0;i<32;i++)
+					{
+						for(j = 0;j<4;j++)
+						{
+							succ_num = 1;
+							tmpwcount=0;
+							tmpqcount=0;
+							if(inblockexceednum[j][i] > 0)
+							{
+								readindex = C_Init_S_Queue_head[j][i];
+								peeknode = C_Init_S_Queue[i][readindex];
+								while((tmpnode=outgoing[tmpnode][succ_num]) != -1)
+								{
+									while(true)
+									{
+										if(inblockavailength[tmpwcount][tmpqcount] > MAX_QUEUE_SIZE/2)
+										{
+											writeindex = C_Init_S_Queue_tail[tmpwcount][tmpqcount];
+											C_Init_S_Queue[tmpqcount][writeindex] = tmpnode;
+											if(C_Init_S_Queue_tail[tmpwcount][tmpqcount]++ == C_Init_S_Queue_indexbackup[tmpwcount+1][tmpqcount])
+											{
+												C_Init_S_Queue_tail[tmpwcount][tmpqcount] -= MAX_QUEUE_SIZE;
+											}
+											succ_num++;
+											break;
+										}
+										else
+										{
+											tmpqcount++;
+											if(tmpqcount == 31)
+											{
+												tmpwcount++;
+												tmpqcount = 0;
+												if(tmpwcount == 3)
+													tmpwcount = 0;
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+
+
+				queuesize = 0;
+				indexcount = 0;
+				for(i = 0; i < 32; i++)
+				{
+					for(j = 0; j < 4; j++)
+					{
+						queuesize += (C_Init_S_Queue_tail[j][i] - C_Init_S_Queue_head[j][i] + MAX_QUEUE_SIZE)%MAX_QUEUE_SIZE;
+						cpbackindex[indexcount]=queuesize;
+						indexcount++;
+					}
+				}
+			}
 			Child_Queue_index[blockIdx.x] = queuesize;
 		}
 
@@ -761,7 +1078,8 @@ __global__ void ChildPath(int startid, int ** G_sequence_Queue, int * taskindex,
 						}
 						G_Queue.G_queue[blockIdx.x][cpbackindex[inblocktindex]+m] = C_Init_S_Queue[Squeueposindex][creadindex];    //not sure about if the memory copy will work,need confirm.
 						C_Init_S_Queue[Squeueposindex][creadindex]=-1;
-						C_Init_S_Queue_head[Squeueindex][Squeueposindex]++;
+						if(C_Init_S_Queue_head[Squeueindex][Squeueposindex]++==C_Init_S_Queue_indexbackup[Squeueindex+1][Squeueposindex])
+							C_Init_S_Queue_head[Squeueindex][Squeueposindex] -= MAX_QUEUE_SIZE;
 					}
 				}
 				if(inblocktindex == 0)
@@ -792,14 +1110,16 @@ __global__ void ChildPath(int startid, int ** G_sequence_Queue, int * taskindex,
 							else
 							{
 								C_Init_S_Queue[Squeueposindex][creadindex] = -1;
-								C_Init_S_Queue_head[Squeueindex][Squeueposindex]++;
+								if(C_Init_S_Queue_head[Squeueindex][Squeueposindex]++ == C_Init_S_Queue_head[Squeueindex+1][Squeueposindex])
+									C_Init_S_Queue_head[Squeueindex][Squeueposindex]-= MAX_QUEUE_SIZE;
 								continue;
 							}
 						}
-						//int tmp = blockIdx.x % G_Queue.blockcount;
-						G_Queue.G_queue[m][Child_Queue_index[m]+cpbackindex[inblocktindex]+m] = C_Init_S_Queue[Squeueposindex][creadindex];
+						int tmp = blockIdx.x % G_Queue.blockcount;
+						G_Queue.G_queue[tmp][Child_Queue_index[m]+cpbackindex[inblocktindex]+m] = C_Init_S_Queue[Squeueposindex][creadindex];
 						C_Init_S_Queue[Squeueposindex][creadindex] = -1;
-						C_Init_S_Queue_head[Squeueindex][Squeueposindex]++;
+						if(C_Init_S_Queue_head[Squeueindex][Squeueposindex]++ == C_Init_S_Queue_head[Squeueindex+1][Squeueposindex])
+							C_Init_S_Queue_head[Squeueindex][Squeueposindex]-= MAX_QUEUE_SIZE;
 					}
 				}
 				if(inblocktindex == 0)
@@ -876,7 +1196,7 @@ int * CudaPath(int initial_t, int sccsize,  int totalsize, int startID, int * sc
 	int * G_sccnodelist;
 
 	int * G_pathrecordingMutex, *H_pathcordingMutex;
-	Pathnode * G_pathrecording, *H_pathrecording;
+	int * G_pathrecording, *H_pathrecording;
 	//int * G_acceptlist;
 	int i=1;
 	size_t acturalsize;
@@ -898,12 +1218,12 @@ int * CudaPath(int initial_t, int sccsize,  int totalsize, int startID, int * sc
 
 	//cudasetdevice();  //optional to use
 	H_path2scc = new int[totalsize-sccsize];
-	H_pathrecording = new Pathnode[totalsize - sccsize];
+	H_pathrecording = new int[totalsize - sccsize];
 	H_pathcordingMutex = new int[totalsize-sccsize];
 	for(i = 0; i < totalsize - sccsize; i++)
 	{
 		H_path2scc[i] = -1;
-		H_pathrecording[i].Nid = i;
+		H_pathrecording[i] = -1;
 		H_pathcordingMutex[i] = 0;
 	}
 
@@ -911,7 +1231,7 @@ int * CudaPath(int initial_t, int sccsize,  int totalsize, int startID, int * sc
 	
 	cudaMalloc((void**)&G_sccnodelist, sizeof(int)*sccsize);
 
-	cudaMalloc((void**)&G_pathrecording, sizeof(Pathnode)*(totalsize - sccsize));
+	cudaMalloc((void**)&G_pathrecording, sizeof(int)*(totalsize - sccsize));
 
 	cudaMalloc((void**)&G_pathrecordingMutex, sizeof(int)*(totalsize - sccsize));
 	
@@ -921,7 +1241,7 @@ int * CudaPath(int initial_t, int sccsize,  int totalsize, int startID, int * sc
 	
 	cudaMemcpy(G_sccnodelist,sccnodelist,sizeof(int)*sccsize, cudaMemcpyHostToDevice);
 
-	cudaMemcpy(G_pathrecording, H_pathrecording, sizeof(Pathnode)*(totalsize-sccsize), cudaMemcpyHostToDevice);
+	cudaMemcpy(G_pathrecording, H_pathrecording, sizeof(int)*(totalsize-sccsize), cudaMemcpyHostToDevice);
 	
 	cudaMemcpy(G_pathrecordingMutex, H_pathcordingMutex, sizeof(int)*(totalsize-sccsize), cudaMemcpyHostToDevice);
 
@@ -995,7 +1315,7 @@ int main()
 	sccnlist = new int[3];
 	outgoing = new int*[15];
 	for(int i=0;i<15;i++)
-		outgoing[i] = new int[3];
+		outgoing[i] = new int[4];
 
 	sccnlist[0] = 10;
 	sccnlist[1] = 17;
@@ -1003,9 +1323,10 @@ int main()
 
 	for(int i=0; i<15;i++)
 	{
-		outgoing[i][0]=i*2+1;
-		outgoing[i][1]=i*2+2;
-		outgoing[i][2]=-1;
+		outgoing[i][0]=2;  // the first position record the amout of succ.
+		outgoing[i][1]=i*2+1;
+		outgoing[i][2]=i*2+2;
+		outgoing[i][3]=-1;
 	}
 
 	result = CudaPath(8,3,31,0,sccnlist,outgoing,3);
